@@ -1,51 +1,13 @@
-import sqlite3
+import PieceMgr
 import logging
 import bottle
 from enum import Enum
 from typing import Any
+import config
 
-MAX_USER_ID = 114514
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
-
-DB_FILENAME = "shit.db"
-TABLE_USERS = "users"
-TABLE_PCS = "art_pieces"
-TABLE_TRANS = "transactions"
-
-db = sqlite3.connect(DB_FILENAME)
-cursor = db.cursor()
-
-for tab in [TABLE_PCS, TABLE_TRANS, TABLE_USERS]:
-    try:
-        cursor.execute(f"select * from {tab}")
-
-    except sqlite3.OperationalError:
-        logging.warning(f"Table '{tab}' not found, creating it")
-        if tab == TABLE_USERS:
-            cursor.execute(f"create table {TABLE_USERS}(\
-                           name     text not null,\
-                           user_id  int unsigned not null)")
-
-        elif tab == TABLE_PCS:
-            cursor.execute(f"create table {TABLE_PCS}(\
-                           name         text not null,\
-                           piece_uid    text not null,\
-                           creator_id   int unsigned not null,\
-                           owner_id     int unsigned not null,\
-                           on_sale      bool not null)")
-
-        elif tab == TABLE_TRANS:
-            cursor.execute(f"create table {TABLE_TRANS}(\
-                           piece_uid    text not null,\
-                           old_owner_id int unsigned not null,\
-                           new_owner_id int unsigned not null,\
-                           dt           datetime not null)")
-
-    except sqlite3.DatabaseError:
-        logging.error(f"Invalid db file: {DB_FILENAME}, check or remove it.")
-        exit(1)
 
 
 class Status(Enum):
@@ -70,24 +32,7 @@ def genReturnValue(status: Status, value: Any) -> str:
     return str(foo)
 
 
-def genId() -> int:
-    """
-    Generates a new user ID by finding the maximum user_id in the users table
-    and incrementing it by one. If the maximum user_id is reached, it returns -1.
-    If the table is empty, it returns 1.
-
-    :return: The new user ID as an integer, or -1 if the maximum ID is reached.
-    """
-    cursor.execute(f"SELECT MAX(user_id) FROM {TABLE_USERS}")
-    id = cursor.fetchone()[0]
-    if id == None:
-        return 1
-
-    if id >= MAX_USER_ID:
-        logging.error("Maximum user ID reached, cannot create new user")
-        return -1
-
-    return id+1
+pieceMgr = PieceMgr.PieceMgr(config.DB_FILENAME)
 
 
 @bottle.route("/")
@@ -106,21 +51,40 @@ def get_user_id() -> str:
     """
     username = bottle.request.query.username  # type: ignore
     if not username:
+        logging.error("Username parameter is missing")
         return genReturnValue(Status.VALUE_ERROR, "Name parameter is required")
 
-    cursor.execute(
-        f"select user_id from {TABLE_USERS} where name = ?", (username,))
-    result = cursor.fetchone()
+    userId = pieceMgr.findUserIdByName(username)
 
-    if result:
-        return genReturnValue(Status.OK, str(result[0]))
-    else:
-        userId = genId()
+    if not userId:
         logging.info(f"User '{username}' not found, creating new user")
-        cursor.execute(f"insert into {TABLE_USERS}(name, user_id) values(?, ?)",
-                       (username, userId))
-        return genReturnValue(Status.OK, str(userId))
+        userId = pieceMgr.newUser(username)
+        if not userId:
+            return genReturnValue(Status.VALUE_ERROR, "Failed to create new user")
 
+    logging.debug(f"User ID for '{username}' is {userId}")
+    return genReturnValue(Status.OK, userId)
+
+@bottle.route("/check_user_exist")
+def check_user_exist() -> str:
+    """
+    The handler for request of checking if a user exists.
+    It expects a query parameter 'username'.
+
+    :return: Status and the user ID if found, otherwise NOT_FOUND.
+    """
+    username = bottle.request.query.username  # type: ignore
+
+    # Parameter validation
+    if not username:
+        return genReturnValue(Status.VALUE_ERROR, "username parameter is required")
+
+    userId = pieceMgr.findUserIdByName(username)
+
+    if not userId:
+        return genReturnValue(Status.NOT_FOUND, "User not found")
+
+    return genReturnValue(Status.OK, userId)
 
 @bottle.route("/new_piece", method="POST")
 def new_piece() -> str:
@@ -135,31 +99,27 @@ def new_piece() -> str:
     """
     args = bottle.request.forms
     user_id = args["user_id"]  # type: ignore
-    piece_name = args["piece_name"]  # type: ignore
+    piece_name = args.getunicode("piece_name")  # type: ignore
     piece_uid = args["piece_uid"]  # type: ignore
 
+    print(piece_name)
     # Parameter validation
     if not user_id or not piece_name or not piece_uid:
         return genReturnValue(Status.VALUE_ERROR,
                               "Parameters user_id, piece_name, and piece_uid are required")
 
     # Check if the user exists
-    cursor.execute(f"select * from {TABLE_USERS} where user_id = ?",
-                   (user_id,))
-    if not cursor.fetchone():
+    if pieceMgr.findUserNameById(int(user_id)) is None:
         return genReturnValue(Status.NOT_FOUND, "User not found")
 
     # Check if the art piece already exists
-    cursor.execute(f"select * from {TABLE_PCS} where piece_uid = ?",
-                   (piece_uid,))
-    if cursor.fetchone():
+    if (not pieceMgr.registerNewPiece(piece_name, piece_uid, int(user_id))):
+        logging.error(f"Art piece with UID {piece_uid} already exists")
         return genReturnValue(Status.ALREADY_EXISTS, "Art piece with this UID already exists")
 
-    # Insert the new art piece into the database and return success
-    cursor.execute(f"insert into {TABLE_PCS}(name, piece_uid, creator_id, owner_id, on_sale) \
-                   values(?, ?, ?, ?, ?)", (piece_name, piece_uid, user_id, user_id, False))
-    db.commit()
-    return genReturnValue(Status.OK, "0")
+    logging.debug(
+        f"New art piece '{piece_name}' with UID {piece_uid} created by user ID {user_id}")
+    return genReturnValue(Status.OK, 0)
 
 
 @bottle.route("/get_piece_info")
@@ -176,25 +136,135 @@ def get_piece_info() -> str:
     if not piece_uid:
         return genReturnValue(Status.VALUE_ERROR, "piece_uid parameter is required")
 
+    result = pieceMgr.findPieceByUid(piece_uid)
     # Check if the art piece exists
-    cursor.execute(
-        f"select * from {TABLE_PCS} where piece_uid = ?", (piece_uid,))
-    result = cursor.fetchone()
     if not result:
         return genReturnValue(Status.NOT_FOUND, "Art piece not found")
-    
-    # Return the art piece information
-    piece_info = {
-        "name": result[0],
-        "creator_id": result[2],
-        "owner_id": result[3],
-        "on_sale": result[4]
-    }
-    return genReturnValue(Status.OK, piece_info)
+
+    return genReturnValue(Status.OK, result)
+
+
+@bottle.route("/mark_on_sale", method="POST")
+def mark_on_sale() -> str:
+    """
+    The handler for request of marking an art piece as on sale.
+    It expects the following form parameters:
+    - user_id: The ID of the user who owns the art piece.
+    - piece_uid: The tag UID of the art piece.
+
+    :return: Status only
+    """
+    args = bottle.request.forms
+    user_id = args["user_id"]  # type: ignore
+    piece_uid = args["piece_uid"]  # type: ignore
+    is_on_sale = args["on_sale"]  # type: ignore
+
+    # Parameter validation
+    if not user_id or not piece_uid or not is_on_sale:
+        return genReturnValue(Status.VALUE_ERROR,
+                              "Parameters user_id, piece_uid, and on_sale are required")
+
+    # Check if the user exists
+    if not pieceMgr.findUserNameById(int(user_id)):
+        return genReturnValue(Status.NOT_FOUND, "User not found")
+
+    # Check if the art piece is owned by the user
+    piece_info = pieceMgr.findPieceByUid(piece_uid)
+    if not piece_info:
+        return genReturnValue(Status.NOT_FOUND, "Art piece not found")
+    if piece_info["owner_id"] != int(user_id):
+        return genReturnValue(Status.VALUE_ERROR, "User does not own this art piece")
+
+    # Update the art piece's on_sale status
+    is_on_sale = is_on_sale.lower() == 'true'
+    pieceMgr.markOnSale(piece_uid, is_on_sale)
+    logging.debug(
+        f"Art piece with UID {piece_uid} marked as {'not' if not is_on_sale else ''} on sale by user ID {user_id}")
+    return genReturnValue(Status.OK, 0)
+
+
+@bottle.route("/get_piece_transactions")
+def get_piece_transactions() -> str:
+    """
+    The handler for request of getting transactions of an art piece.
+    It expects a query parameter 'piece_uid'.
+
+    :return: Status and the list of transactions.
+    """
+    piece_uid = bottle.request.query.piece_uid  # type: ignore
+
+    # Parameter validation
+    if not piece_uid:
+        return genReturnValue(Status.VALUE_ERROR, "piece_uid parameter is required")
+
+    result = pieceMgr.getTransactions(piece_uid)
+    # Check if the art piece exists
+    if not result:
+        return genReturnValue(Status.NOT_FOUND, "No transactions found for this art piece")
+
+    return genReturnValue(Status.OK, result)
+
+
+@bottle.route("/new_transaction", method="POST")
+def new_transaction() -> str:
+    """
+    The handler for request of creating a new transaction for an art piece.
+    It expects the following form parameters:
+    - old_owner_id: The ID of the user who is the old owner of the art piece.
+    - new_owner_id: The ID of the user who is the new owner of the art piece.
+    - piece_uid: The tag UID of the art piece.
+
+    :return: Status only
+    """
+    args = bottle.request.forms
+    old_owner_id = args["old_owner_id"]  # type: ignore
+    new_owner_id = args["new_owner_id"]  # type: ignore
+    piece_uid = args["piece_uid"]  # type: ignore
+    # Parameter validation
+    if not old_owner_id or not new_owner_id or not piece_uid:
+        return genReturnValue(Status.VALUE_ERROR,
+                              "Parameters old_owner_id, new_owner_id, and piece_uid are required")
+
+    # Check if the old owner exists
+    if not pieceMgr.findUserNameById(int(old_owner_id)):
+        return genReturnValue(Status.NOT_FOUND, "Old owner not found")
+
+    # Check if the new owner exists
+    if not pieceMgr.findUserNameById(int(new_owner_id)):
+        return genReturnValue(Status.NOT_FOUND, "New owner not found")
+
+    if pieceMgr.newTransaction(piece_uid, int(old_owner_id), int(new_owner_id)):
+        logging.debug(
+            f"New transaction created for piece UID {piece_uid} from old owner ID {old_owner_id} to new owner ID {new_owner_id}")
+        return genReturnValue(Status.OK, 0)
+
+    logging.error(
+        f"Failed to create transaction for piece UID {piece_uid} from old owner ID {old_owner_id} to new owner ID {new_owner_id}")
+    return genReturnValue(Status.VALUE_ERROR, "User does not own this art piece or piece UID is invalid")
+
+
+@bottle.route("/creator_get_pieces")
+def creator_get_pieces() -> str:
+    """
+    The handler for request of getting all art pieces created by a specific user.
+    It expects a query parameter 'user_id'.
+
+    :return: Status and the list of art pieces.
+    """
+    user_id = bottle.request.query.user_id  # type: ignore
+
+    # Parameter validation
+    if not user_id:
+        return genReturnValue(Status.VALUE_ERROR, "user_id parameter is required")
+
+    result = pieceMgr.getCreatorPieces(int(user_id))
+    # Check if the user exists
+    print(result)
+    if not result:
+        return genReturnValue(Status.NOT_FOUND, "No art pieces found for this user")
+
+    return genReturnValue(Status.OK, result)
 
 
 # This will block the main thread until the server is stopped
 bottle.run(host="0.0.0.0", port=2333)
-
-db.close()
-exit()

@@ -111,7 +111,7 @@ class PieceMgr:
             "piece_uid": result[1],
             "creator": self.findUserNameById(result[2]),
             "owner": self.findUserNameById(result[3]),
-            "on_sale": result[4]
+            "on_sale": True if result[4] else False
         } if result else None
 
     def markOnSale(self, piece_uid: str, is_on_sale: bool) -> bool:
@@ -166,6 +166,32 @@ class PieceMgr:
 
         return transactions
 
+    def newTransaction(self, piece_uid: str, old_owner_id: int, new_owner_id: int) -> bool:
+        """
+        Creates a new transaction for an art piece.
+
+        :param piece_uid: The tag UID of the art piece.
+        :param old_owner_id: The ID of the user who is the old owner of the art piece.
+        :param new_owner_id: The ID of the user who is the new owner of the art piece.
+        :return: True if the operation was successful, otherwise False.
+        """
+
+        self.__cursor.execute(f"select owner_id from {TABLE_PCS} where piece_uid = ?", (piece_uid,))
+        result = self.__cursor.fetchone()
+        if not result:
+            logging.error(f"Art piece with UID {piece_uid} not found")
+            return False
+        if result[0] != old_owner_id:
+            logging.error(f"Old owner ID {old_owner_id} does not match current owner for piece UID {piece_uid}")
+            return False
+
+        self.__cursor.execute(f"insert into {TABLE_TRANS}(piece_uid, old_owner_id, new_owner_id, dt) \
+                              values(?, ?, ?, datetime('now'))", (piece_uid, old_owner_id, new_owner_id))
+        self.__cursor.execute(f"update {TABLE_PCS} set owner_id = ? where piece_uid = ?", (new_owner_id, piece_uid))
+        self.__db.commit()
+
+        return True
+
     def getCreatorPieces(self, creator_id: int) -> Optional[list]:
         """
         Retrieves all art pieces info created by a specific user.
@@ -181,12 +207,13 @@ class PieceMgr:
 
         pieces = []
         for row in self.__cursor.fetchall():
+            logging.debug(f"Found piece: {row[0]} with UID {row[1]}")
             pieces.append({
                 "name": row[0],
                 "piece_uid": row[1],
                 "creator": self.findUserNameById(row[2]),
                 "owner": self.findUserNameById(row[3]),
-                "on_sale": row[4]
+                "on_sale": True if row[4] else False
             })
 
         return pieces
